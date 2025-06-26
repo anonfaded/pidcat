@@ -99,7 +99,7 @@ python pidcat.py -t "AuthService" -t "Database" com.yourapp.package
 <br>
 
 <details>
-<summary><strong>Original Project README & License Information</strong></summary>
+<summary><strong>Original Project README</strong></summary>
 
 <br>
 
