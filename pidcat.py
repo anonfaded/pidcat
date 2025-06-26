@@ -26,15 +26,44 @@ import sys
 import re
 import subprocess
 from subprocess import PIPE
+import shutil
+import colorama
 
-__version__ = '2.1.0'
+# Initialize colorama to process ANSI escape codes on Windows
+colorama.init()
+
+# A sensible version bump reflecting new features.
+__version__ = '2.2.0'
+
+
+def check_adb_device():
+    """Checks for a connected ADB device and exits if none is found."""
+    try:
+        # Use a timeout to prevent the command from hanging indefinitely.
+        result = subprocess.run(['adb', 'devices'], capture_output=True, text=True, check=True, timeout=5)
+        lines = result.stdout.strip().splitlines()
+        # Ensure there is at least one line after the header, and it indicates a device.
+        if len(lines) < 2 or not any('device' in line and not 'unauthorized' in line for line in lines[1:]):
+            print("❌ ERROR: No authorized ADB device found. Please connect a device with USB debugging enabled.", file=sys.stderr)
+            sys.exit(1)
+        print("✅ Found device(s).")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("❌ ERROR: 'adb' command not found. Is the Android SDK Platform-Tools in your system's PATH?", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("❌ ERROR: 'adb devices' command timed out. ADB server may be unresponsive.", file=sys.stderr)
+        sys.exit(1)
+
 
 LOG_LEVELS = 'VDIWEF'
 LOG_LEVELS_MAP = dict([(LOG_LEVELS[i], i) for i in range(len(LOG_LEVELS))])
-parser = argparse.ArgumentParser(description='Filter logcat by package name')
+parser = argparse.ArgumentParser(
+    description='Filter logcat by package name with colored output.',
+    epilog='Example: python pidcat.py com.example.app'
+)
 parser.add_argument('package', nargs='*', help='Application package name(s)')
 parser.add_argument('-w', '--tag-width', metavar='N', dest='tag_width', type=int, default=23, help='Width of log tag')
-parser.add_argument('-l', '--min-level', dest='min_level', type=str, choices=LOG_LEVELS+LOG_LEVELS.lower(), default='V', help='Minimum level to be displayed')
+parser.add_argument('-l', '--min-level', dest='min_level', type=str, choices=LOG_LEVELS+LOG_LEVELS.lower(), default='V', help='Minimum level to be displayed (V, D, I, W, E, F)')
 parser.add_argument('--color-gc', dest='color_gc', action='store_true', help='Color garbage collection')
 parser.add_argument('--always-display-tags', dest='always_tags', action='store_true',help='Always display the tag name')
 parser.add_argument('--current', dest='current_app', action='store_true',help='Filter logcat by current running app')
@@ -52,87 +81,77 @@ min_level = LOG_LEVELS_MAP[args.min_level.upper()]
 
 package = args.package
 
+print(f"--- Colored Logcat v{__version__} ---")
+check_adb_device()
+
 base_adb_command = ['adb']
 if args.device_serial:
   base_adb_command.extend(['-s', args.device_serial])
+  print(f" targeting device serial: {args.device_serial}")
 if args.use_device:
   base_adb_command.append('-d')
+  print(" targeting first connected device.")
 if args.use_emulator:
   base_adb_command.append('-e')
+  print(" targeting first running emulator.")
 
 if args.current_app:
+  print(" looking for current running app...")
   system_dump_command = base_adb_command + ["shell", "dumpsys", "activity", "activities"]
-  system_dump = subprocess.Popen(system_dump_command, stdout=PIPE, stderr=PIPE).communicate()[0]
-  running_package_name = re.search(".*TaskRecord.*A[= ]([^ ^}]*)", str(system_dump)).group(1)
-  package.append(running_package_name)
+  system_dump_process = subprocess.Popen(system_dump_command, stdout=PIPE, stderr=PIPE, universal_newlines=True)
+  system_dump = system_dump_process.communicate()[0]
+  running_package_name_match = re.search(".*TaskRecord.*A[= ]([^ ^}]*)", system_dump)
+  if running_package_name_match:
+      current_package = running_package_name_match.group(1)
+      package.append(current_package)
+      print(f" found current app: {current_package}")
+
 
 if len(package) == 0:
   args.all = True
+  print("No package name provided, switching to --all mode.")
+else:
+  print(f"Filtering for packages: {package}")
 
-# Store the names of packages for which to match all processes.
-catchall_package = list(filter(lambda package: package.find(":") == -1, package))
-# Store the name of processes to match exactly.
-named_processes = list(filter(lambda package: package.find(":") != -1, package))
-# Convert default process names from <package>: (cli notation) to <package> (android notation) in the exact names match group.
-named_processes = map(lambda package: package if package.find(":") != len(package) - 1 else package[:-1], named_processes)
+catchall_package = list(filter(lambda p: p.find(":") == -1, package))
+named_processes = list(filter(lambda p: p.find(":") != -1, package))
+named_processes = list(map(lambda p: p if p.find(":") != len(p) - 1 else p[:-1], named_processes))
 
-header_size = args.tag_width + 1 + 3 + 1 # space, level, space
-
+header_size = args.tag_width + 1 + 3 + 1
 stdout_isatty = sys.stdout.isatty()
 
 width = -1
 try:
-  # Get the current terminal width
-  import fcntl, termios, struct
-  h, width = struct.unpack('hh', fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('hh', 0, 0)))
-except:
+  width, _ = shutil.get_terminal_size()
+except OSError:
   pass
 
 BLACK, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE = range(8)
-
 RESET = '\033[0m'
 
 def termcolor(fg=None, bg=None):
   codes = []
   if fg is not None: codes.append('3%d' % fg)
-  if bg is not None: codes.append('10%d' % bg)
+  if bg is not None: codes.append('4%d' % bg)
   return '\033[%sm' % ';'.join(codes) if codes else ''
 
 def colorize(message, fg=None, bg=None):
   return termcolor(fg, bg) + message + RESET if stdout_isatty else message
 
 def indent_wrap(message):
-  if width == -1:
-    return message
-  message = message.replace('\t', '    ')
-  wrap_area = width - header_size
-  messagebuf = ''
-  current = 0
-  while current < len(message):
-    next = min(current + wrap_area, len(message))
-    messagebuf += message[current:next]
-    if next < len(message):
-      messagebuf += '\n'
-      messagebuf += ' ' * header_size
-    current = next
-  return messagebuf
-
+    if width <= 0 or (width - header_size) <= 0:
+        return message
+    message = message.replace('\t', '    ')
+    wrap_area = width - header_size
+    return '\n'.join([message[i:i+wrap_area] for i in range(0, len(message), wrap_area)])
 
 LAST_USED = [RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN]
 KNOWN_TAGS = {
-  'dalvikvm': WHITE,
-  'Process': WHITE,
-  'ActivityManager': WHITE,
-  'ActivityThread': WHITE,
-  'AndroidRuntime': CYAN,
-  'jdwp': WHITE,
-  'StrictMode': WHITE,
-  'DEBUG': YELLOW,
+  'dalvikvm': WHITE, 'Process': WHITE, 'ActivityManager': WHITE, 'ActivityThread': WHITE,
+  'AndroidRuntime': CYAN, 'jdwp': WHITE, 'StrictMode': WHITE, 'DEBUG': YELLOW,
 }
 
 def allocate_color(tag):
-  # this will allocate a unique format for the given tag
-  # since we dont have very many colors, we always keep track of the LRU
   if tag not in KNOWN_TAGS:
     KNOWN_TAGS[tag] = LAST_USED[0]
   color = KNOWN_TAGS[tag]
@@ -141,32 +160,19 @@ def allocate_color(tag):
     LAST_USED.append(color)
   return color
 
-
-RULES = {
-  # StrictMode policy violation; ~duration=319 ms: android.os.StrictMode$StrictModeDiskWriteViolation: policy=31 violation=1
-  re.compile(r'^(StrictMode policy violation)(; ~duration=)(\d+ ms)')
-    : r'%s\1%s\2%s\3%s' % (termcolor(RED), RESET, termcolor(YELLOW), RESET),
-}
-
-# Only enable GC coloring if the user opted-in
+RULES = {re.compile(r'^(StrictMode policy violation)(; ~duration=)(\d+ ms)') : r'%s\1%s\2%s\3%s' % (termcolor(RED), RESET, termcolor(YELLOW), RESET)}
 if args.color_gc:
-  # GC_CONCURRENT freed 3617K, 29% free 20525K/28648K, paused 4ms+5ms, total 85ms
   key = re.compile(r'^(GC_(?:CONCURRENT|FOR_M?ALLOC|EXTERNAL_ALLOC|EXPLICIT) )(freed <?\d+.)(, \d+\% free \d+./\d+., )(paused \d+ms(?:\+\d+ms)?)')
   val = r'\1%s\2%s\3%s\4%s' % (termcolor(GREEN), RESET, termcolor(YELLOW), RESET)
-
   RULES[key] = val
 
-
 TAGTYPES = {
-  'V': colorize(' V ', fg=WHITE, bg=BLACK),
-  'D': colorize(' D ', fg=BLACK, bg=BLUE),
-  'I': colorize(' I ', fg=BLACK, bg=GREEN),
-  'W': colorize(' W ', fg=BLACK, bg=YELLOW),
-  'E': colorize(' E ', fg=BLACK, bg=RED),
-  'F': colorize(' F ', fg=BLACK, bg=RED),
+  'V': colorize(' V ', fg=WHITE, bg=BLACK), 'D': colorize(' D ', fg=BLACK, bg=BLUE),
+  'I': colorize(' I ', fg=BLACK, bg=GREEN), 'W': colorize(' W ', fg=BLACK, bg=YELLOW),
+  'E': colorize(' E ', fg=BLACK, bg=RED),   'F': colorize(' F ', fg=BLACK, bg=RED),
 }
 
-PID_LINE = re.compile(r'^\w+\s+(\w+)\s+\w+\s+\w+\s+\w+\s+\w+\s+\w+\s+\w\s([\w|\.|\/]+)$')
+PID_LINE = re.compile(r'^\w+\s+(\w+)\s+.*?\s([\w|\.|\/]+)$')
 PID_START = re.compile(r'^.*: Start proc ([a-zA-Z0-9._:]+) for ([a-z]+ [^:]+): pid=(\d+) uid=(\d+) gids=(.*)$')
 PID_START_5_1 = re.compile(r'^.*: Start proc (\d+):([a-zA-Z0-9._:]+)/[a-z0-9]+ for (.*)$')
 PID_START_DALVIK = re.compile(r'^E/dalvikvm\(\s*(\d+)\): >>>>> ([a-zA-Z0-9._:]+) \[ userId:0 \| appId:(\d+) \]$')
@@ -181,182 +187,142 @@ adb_command = base_adb_command[:]
 adb_command.append('logcat')
 adb_command.extend(['-v', 'brief'])
 
-# Clear log before starting logcat
 if args.clear_logcat:
-  adb_clear_command = list(adb_command)
-  adb_clear_command.append('-c')
-  adb_clear = subprocess.Popen(adb_clear_command)
+  print("Clearing logcat buffer (this may fail on some Android versions)...")
+  try:
+    subprocess.run(list(adb_command) + ['-c'], check=True, capture_output=True)
+    print("Buffer cleared successfully.")
+  except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    print("Warning: Could not clear log buffer. This is common on newer Android versions.")
 
-  while adb_clear.poll() is None:
-    pass
-
-# This is a ducktype of the subprocess.Popen object
 class FakeStdinProcess():
-  def __init__(self):
-    self.stdout = sys.stdin
-  def poll(self):
-    return None
+  def __init__(self): self.stdout = sys.stdin
+  def poll(self): return None
 
-if sys.stdin.isatty():
-  adb = subprocess.Popen(adb_command, stdin=PIPE, stdout=PIPE)
-else:
-  adb = FakeStdinProcess()
+adb = subprocess.Popen(adb_command, stdin=PIPE, stdout=PIPE) if sys.stdin.isatty() else FakeStdinProcess()
 pids = set()
 last_tag = None
 app_pid = None
 
 def match_packages(token):
-  if len(package) == 0:
-    return True
-  if token in named_processes:
-    return True
+  if not package: return True
+  if token in named_processes: return True
   index = token.find(':')
   return (token in catchall_package) if index == -1 else (token[:index] in catchall_package)
 
 def parse_death(tag, message):
-  if tag != 'ActivityManager':
-    return None, None
-  kill = PID_KILL.match(message)
-  if kill:
-    pid = kill.group(1)
-    package_line = kill.group(2)
-    if match_packages(package_line) and pid in pids:
-      return pid, package_line
-  leave = PID_LEAVE.match(message)
-  if leave:
-    pid = leave.group(2)
-    package_line = leave.group(1)
-    if match_packages(package_line) and pid in pids:
-      return pid, package_line
-  death = PID_DEATH.match(message)
-  if death:
-    pid = death.group(2)
-    package_line = death.group(1)
-    if match_packages(package_line) and pid in pids:
-      return pid, package_line
+  if tag != 'ActivityManager': return None, None
+  for pattern in [PID_KILL, PID_LEAVE, PID_DEATH]:
+    m = pattern.match(message)
+    if m:
+      pid = m.group(1) if pattern != PID_LEAVE else m.group(2)
+      pname = m.group(2) if pattern != PID_LEAVE else m.group(1)
+      if match_packages(pname) and pid in pids: return pid, pname
   return None, None
 
 def parse_start_proc(line):
-  start = PID_START_5_1.match(line)
-  if start is not None:
-    line_pid, line_package, target = start.groups()
-    return line_package, target, line_pid, '', ''
-  start = PID_START.match(line)
-  if start is not None:
-    line_package, target, line_pid, line_uid, line_gids = start.groups()
-    return line_package, target, line_pid, line_uid, line_gids
-  start = PID_START_DALVIK.match(line)
-  if start is not None:
-    line_pid, line_package, line_uid = start.groups()
-    return line_package, '', line_pid, line_uid, ''
+  patterns = [PID_START_5_1, PID_START, PID_START_DALVIK]
+  for pattern in patterns:
+    start = pattern.match(line)
+    if start:
+      if pattern == PID_START_5_1: return start.group(2), start.group(3), start.group(1), '', ''
+      if pattern == PID_START: return start.groups()
+      if pattern == PID_START_DALVIK: return start.group(2), '', start.group(1), start.group(3), ''
   return None
 
 def tag_in_tags_regex(tag, tags):
-  return any(re.match(r'^' + t + r'$', tag) for t in map(str.strip, tags))
+  return any(re.match(r'^' + t + r'$', tag, re.IGNORECASE) for t in map(str.strip, tags))
 
-ps_command = base_adb_command + ['shell', 'ps']
-ps_pid = subprocess.Popen(ps_command, stdin=PIPE, stdout=PIPE, stderr=PIPE)
-while True:
-  try:
-    line = ps_pid.stdout.readline().decode('utf-8', 'replace').strip()
-  except KeyboardInterrupt:
-    break
-  if len(line) == 0:
-    break
+if not args.all:
+    print(f"Searching for running process(es) for '{', '.join(package)}'...")
+    ps_command = base_adb_command + ['shell', 'ps']
+    try:
+        ps_process = subprocess.Popen(ps_command, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        for line_bytes in ps_process.stdout:
+            line = line_bytes.decode('utf-8', 'replace').strip()
+            pid_match = PID_LINE.match(line)
+            if pid_match:
+                pid, proc = pid_match.groups()
+                if match_packages(proc):
+                    pids.add(pid)
+        if pids:
+            print(f"✅ Success! Found PID(s): {', '.join(pids)}. Now listening...")
+        else:
+            print(f"⚠️ Warning: No running process found for '{', '.join(package)}'. Waiting for it to start...")
+    except FileNotFoundError:
+        print("❌ ERROR: Could not find a running ADB process. Please check the connection.", file=sys.stderr)
+        sys.exit(1)
 
-  pid_match = PID_LINE.match(line)
-  if pid_match is not None:
-    pid = pid_match.group(1)
-    proc = pid_match.group(2)
-    if proc in catchall_package:
-      seen_pids = True
-      pids.add(pid)
 
-while adb.poll() is None:
-  try:
-    line = adb.stdout.readline().decode('utf-8', 'replace').strip()
-  except KeyboardInterrupt:
-    break
-  if len(line) == 0:
-    break
+print("\n--- Listening for logcat messages... (Press Ctrl+C to exit) ---\n")
 
-  bug_line = BUG_LINE.match(line)
-  if bug_line is not None:
-    continue
+try:
+    while adb.poll() is None:
+      line = adb.stdout.readline().decode('utf-8', 'replace').strip()
+      if not line: break
+      if BUG_LINE.match(line): continue
+      log_line = LOG_LINE.match(line)
+      if not log_line: continue
 
-  log_line = LOG_LINE.match(line)
-  if log_line is None:
-    continue
+      level, tag, owner, message = log_line.groups()
+      tag = tag.strip()
+      
+      start = parse_start_proc(line)
+      if start:
+        line_package, target, line_pid, line_uid, line_gids = start
+        if match_packages(line_package) and line_pid not in pids:
+          pids.add(line_pid)
+          app_pid = line_pid
+          linebuf  = '\n' + colorize(' ' * (header_size - 1), bg=WHITE)
+          linebuf += indent_wrap(' Process %s created for %s\n' % (line_package, target))
+          linebuf += colorize(' ' * (header_size - 1), bg=WHITE)
+          linebuf += ' PID: %s   UID: %s   GIDs: %s' % (line_pid, line_uid, line_gids)
+          linebuf += '\n'
+          print(linebuf)
+          last_tag = None
 
-  level, tag, owner, message = log_line.groups()
-  tag = tag.strip()
-  start = parse_start_proc(line)
-  if start:
-    line_package, target, line_pid, line_uid, line_gids = start
-    if match_packages(line_package):
-      pids.add(line_pid)
+      dead_pid, dead_pname = parse_death(tag, message)
+      if dead_pid and dead_pid in pids:
+        pids.remove(dead_pid)
+        linebuf  = '\n' + colorize(' ' * (header_size - 1), bg=RED)
+        linebuf += ' Process %s (PID: %s) ended' % (dead_pname, dead_pid)
+        linebuf += '\n'
+        print(linebuf)
+        last_tag = None
 
-      app_pid = line_pid
+      if tag == 'DEBUG' and BACKTRACE_LINE.match(message.lstrip()):
+        message = message.lstrip()
+        owner = app_pid
 
-      linebuf  = '\n'
-      linebuf += colorize(' ' * (header_size - 1), bg=WHITE)
-      linebuf += indent_wrap(' Process %s created for %s\n' % (line_package, target))
-      linebuf += colorize(' ' * (header_size - 1), bg=WHITE)
-      linebuf += ' PID: %s   UID: %s   GIDs: %s' % (line_pid, line_uid, line_gids)
-      linebuf += '\n'
+      if not args.all and owner not in pids: continue
+      if level in LOG_LEVELS_MAP and LOG_LEVELS_MAP[level] < min_level: continue
+      if args.ignored_tag and tag_in_tags_regex(tag, args.ignored_tag): continue
+      if args.tag and not tag_in_tags_regex(tag, args.tag): continue
+
+      linebuf = ''
+      if args.tag_width > 0:
+        if tag != last_tag or args.always_tags:
+          last_tag = tag
+          color = allocate_color(tag)
+          tag = tag[-args.tag_width:].rjust(args.tag_width)
+          linebuf += colorize(tag, fg=color)
+        else:
+          linebuf += ' ' * args.tag_width
+        linebuf += ' '
+
+      linebuf += TAGTYPES.get(level, ' ' + level + ' ')
+      linebuf += ' '
+
+      for matcher, replace in RULES.items():
+        message = matcher.sub(replace, message)
+
+      linebuf += indent_wrap(message)
       print(linebuf)
-      last_tag = None # Ensure next log gets a tag printed
 
-  dead_pid, dead_pname = parse_death(tag, message)
-  if dead_pid:
-    pids.remove(dead_pid)
-    linebuf  = '\n'
-    linebuf += colorize(' ' * (header_size - 1), bg=RED)
-    linebuf += ' Process %s (PID: %s) ended' % (dead_pname, dead_pid)
-    linebuf += '\n'
-    print(linebuf)
-    last_tag = None # Ensure next log gets a tag printed
-
-  # Make sure the backtrace is printed after a native crash
-  if tag == 'DEBUG':
-    bt_line = BACKTRACE_LINE.match(message.lstrip())
-    if bt_line is not None:
-      message = message.lstrip()
-      owner = app_pid
-
-  if not args.all and owner not in pids:
-    continue
-  if level in LOG_LEVELS_MAP and LOG_LEVELS_MAP[level] < min_level:
-    continue
-  if args.ignored_tag and tag_in_tags_regex(tag, args.ignored_tag):
-    continue
-  if args.tag and not tag_in_tags_regex(tag, args.tag):
-    continue
-
-  linebuf = ''
-
-  if args.tag_width > 0:
-    # right-align tag title and allocate color if needed
-    if tag != last_tag or args.always_tags:
-      last_tag = tag
-      color = allocate_color(tag)
-      tag = tag[-args.tag_width:].rjust(args.tag_width)
-      linebuf += colorize(tag, fg=color)
-    else:
-      linebuf += ' ' * args.tag_width
-    linebuf += ' '
-
-  # write out level colored edge
-  if level in TAGTYPES:
-    linebuf += TAGTYPES[level]
-  else:
-    linebuf += ' ' + level + ' '
-  linebuf += ' '
-
-  # format tag message using rules
-  for matcher in RULES:
-    replace = RULES[matcher]
-    message = matcher.sub(replace, message)
-
-  linebuf += indent_wrap(message)
-  print(linebuf.encode('utf-8'))
+except KeyboardInterrupt:
+    print("\n--- Exiting gracefully. ---")
+except Exception as e:
+    print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
+finally:
+    # De-initialize colorama to restore original terminal settings.
+    colorama.deinit()
