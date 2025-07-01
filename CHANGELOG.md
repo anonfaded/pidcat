@@ -1,6 +1,14 @@
 Change Log
 ==========
 
+Version 2.3.0 *(2025-07-02)*
+----------------------------
+
+ * New: Added interactive device selection when multiple devices are connected
+ * Fix: Improved handling of subprocess outputs
+ * Fix: Better error handling for adb commands
+
+
 Version 2.1.0 *(2016-09-07)*
 ----------------------------
 

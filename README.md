@@ -25,6 +25,7 @@ Its primary enhancements provide full **Windows support** and **vastly improved 
 *   🎨 **Color-Coded Output:** Makes logs scannable by color-coding tags and log levels (Verbose, Debug, Info, Warn, Error).
 *   📦 **Smart Package Filtering:** Automatically find an app's Process ID (PID) and show only relevant logs.
 *   🗣️ **Verbose Feedback:** The script tells you what it's doing! It confirms device connections, finds PIDs, and warns you if a specified app isn't running—no more silent failures.
+*   📱 **Multiple Device Support:** Interactive device selection when multiple devices are connected.
 *   ⚡ **Windows Automation:** Includes an interactive `.bat` script to automate your logging session with a double-click.
 *   ⚙️ **Powerful Filtering Options:** Filter by minimum log level, specific tags, and more.
 
