@@ -33,20 +33,55 @@ import colorama
 colorama.init()
 
 # A sensible version bump reflecting new features.
-__version__ = '2.2.0'
+__version__ = '2.3.0'
 
 
 def check_adb_device():
-    """Checks for a connected ADB device and exits if none is found."""
+    """Checks for a connected ADB device and prompts for selection if multiple are found."""
     try:
         # Use a timeout to prevent the command from hanging indefinitely.
         result = subprocess.run(['adb', 'devices'], capture_output=True, text=True, check=True, timeout=5)
         lines = result.stdout.strip().splitlines()
-        # Ensure there is at least one line after the header, and it indicates a device.
-        if len(lines) < 2 or not any('device' in line and not 'unauthorized' in line for line in lines[1:]):
+        
+        # Skip the first line which is just a header
+        device_lines = [line for line in lines[1:] if line.strip()]
+        
+        # Check if we have any authorized devices
+        authorized_devices = []
+        for line in device_lines:
+            parts = line.split()
+            if len(parts) >= 2 and 'device' in parts[1] and 'unauthorized' not in parts[1]:
+                authorized_devices.append(parts[0])  # The first part is the device serial
+                
+        if not authorized_devices:
             print("❌ ERROR: No authorized ADB device found. Please connect a device with USB debugging enabled.", file=sys.stderr)
             sys.exit(1)
-        print("✅ Found device(s).")
+            
+        # If we have one device, or device selection parameters are already provided, we're good
+        if len(authorized_devices) == 1 or args.device_serial or args.use_device or args.use_emulator:
+            print(f"✅ Found {len(authorized_devices)} device(s).")
+            return None  # No need to select a device
+            
+        # If we have multiple devices and no selection made, ask the user
+        print(f"📱 Multiple devices found ({len(authorized_devices)}). Please select one:")
+        for idx, device in enumerate(authorized_devices):
+            print(f"  [{idx + 1}] {device}")
+            
+        selection = None
+        while selection is None:
+            try:
+                choice = input("Enter device number [1-{}]: ".format(len(authorized_devices)))
+                idx = int(choice) - 1
+                if 0 <= idx < len(authorized_devices):
+                    selection = authorized_devices[idx]
+                else:
+                    print("❌ Invalid selection. Please try again.")
+            except ValueError:
+                print("❌ Please enter a valid number.")
+                
+        print(f"✅ Selected device: {selection}")
+        return selection
+            
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("❌ ERROR: 'adb' command not found. Is the Android SDK Platform-Tools in your system's PATH?", file=sys.stderr)
         sys.exit(1)
@@ -82,16 +117,19 @@ min_level = LOG_LEVELS_MAP[args.min_level.upper()]
 package = args.package
 
 print(f"--- Colored Logcat v{__version__} ---")
-check_adb_device()
+selected_device = check_adb_device()
 
 base_adb_command = ['adb']
 if args.device_serial:
   base_adb_command.extend(['-s', args.device_serial])
   print(f" targeting device serial: {args.device_serial}")
-if args.use_device:
+elif selected_device:
+  base_adb_command.extend(['-s', selected_device])
+  print(f" targeting selected device: {selected_device}")
+elif args.use_device:
   base_adb_command.append('-d')
   print(" targeting first connected device.")
-if args.use_emulator:
+elif args.use_emulator:
   base_adb_command.append('-e')
   print(" targeting first running emulator.")
 
@@ -196,10 +234,13 @@ if args.clear_logcat:
     print("Warning: Could not clear log buffer. This is common on newer Android versions.")
 
 class FakeStdinProcess():
-  def __init__(self): self.stdout = sys.stdin
-  def poll(self): return None
+  def __init__(self):
+    self.stdout = sys.stdin
+    self.returncode = None
+  
+  def poll(self):
+    return None
 
-adb = subprocess.Popen(adb_command, stdin=PIPE, stdout=PIPE) if sys.stdin.isatty() else FakeStdinProcess()
 pids = set()
 last_tag = None
 app_pid = None
@@ -233,13 +274,18 @@ def parse_start_proc(line):
 def tag_in_tags_regex(tag, tags):
   return any(re.match(r'^' + t + r'$', tag, re.IGNORECASE) for t in map(str.strip, tags))
 
+# Initialize ADB connection
+if sys.stdin.isatty():
+    adb = subprocess.Popen(adb_command, stdin=PIPE, stdout=PIPE, text=True)
+else:
+    adb = FakeStdinProcess()
+
 if not args.all:
     print(f"Searching for running process(es) for '{', '.join(package)}'...")
     ps_command = base_adb_command + ['shell', 'ps']
     try:
-        ps_process = subprocess.Popen(ps_command, stdin=PIPE, stdout=PIPE, stderr=PIPE)
-        for line_bytes in ps_process.stdout:
-            line = line_bytes.decode('utf-8', 'replace').strip()
+        ps_output = subprocess.check_output(ps_command, universal_newlines=True)
+        for line in ps_output.splitlines():
             pid_match = PID_LINE.match(line)
             if pid_match:
                 pid, proc = pid_match.groups()
@@ -252,77 +298,96 @@ if not args.all:
     except FileNotFoundError:
         print("❌ ERROR: Could not find a running ADB process. Please check the connection.", file=sys.stderr)
         sys.exit(1)
-
+    except subprocess.CalledProcessError:
+        print("⚠️ Warning: Error executing PS command. Will still attempt to capture logs.")
 
 print("\n--- Listening for logcat messages... (Press Ctrl+C to exit) ---\n")
 
 try:
-    while adb.poll() is None:
-      line = adb.stdout.readline().decode('utf-8', 'replace').strip()
-      if not line: break
-      if BUG_LINE.match(line): continue
-      log_line = LOG_LINE.match(line)
-      if not log_line: continue
+    while adb and adb.poll() is None:
+        try:
+            if hasattr(adb, 'stdout') and adb.stdout:
+                line = adb.stdout.readline()
+            elif not sys.stdin.isatty():
+                line = sys.stdin.readline()
+            else:
+                # No valid input source
+                break
+                
+            if not line:  # End of file
+                break
+                
+            # Ensure it's a string (should be with text=True)
+            line = line.strip()
+            if not line:
+                continue
+                
+            if BUG_LINE.match(line):
+                continue
+                
+            log_line = LOG_LINE.match(line)
+            if not log_line:
+                continue
 
-      level, tag, owner, message = log_line.groups()
-      tag = tag.strip()
-      
-      start = parse_start_proc(line)
-      if start:
-        line_package, target, line_pid, line_uid, line_gids = start
-        if match_packages(line_package) and line_pid not in pids:
-          pids.add(line_pid)
-          app_pid = line_pid
-          linebuf  = '\n' + colorize(' ' * (header_size - 1), bg=WHITE)
-          linebuf += indent_wrap(' Process %s created for %s\n' % (line_package, target))
-          linebuf += colorize(' ' * (header_size - 1), bg=WHITE)
-          linebuf += ' PID: %s   UID: %s   GIDs: %s' % (line_pid, line_uid, line_gids)
-          linebuf += '\n'
-          print(linebuf)
-          last_tag = None
+            level, tag, owner, message = log_line.groups()
+            tag = tag.strip()
+            
+            start = parse_start_proc(line)
+            if start:
+              line_package, target, line_pid, line_uid, line_gids = start
+              if match_packages(line_package) and line_pid not in pids:
+                pids.add(line_pid)
+                app_pid = line_pid
+                linebuf  = '\n' + colorize(' ' * (header_size - 1), bg=WHITE)
+                linebuf += indent_wrap(' Process %s created for %s\n' % (line_package, target))
+                linebuf += colorize(' ' * (header_size - 1), bg=WHITE)
+                linebuf += ' PID: %s   UID: %s   GIDs: %s' % (line_pid, line_uid, line_gids)
+                linebuf += '\n'
+                print(linebuf)
+                last_tag = None
 
-      dead_pid, dead_pname = parse_death(tag, message)
-      if dead_pid and dead_pid in pids:
-        pids.remove(dead_pid)
-        linebuf  = '\n' + colorize(' ' * (header_size - 1), bg=RED)
-        linebuf += ' Process %s (PID: %s) ended' % (dead_pname, dead_pid)
-        linebuf += '\n'
-        print(linebuf)
-        last_tag = None
+            dead_pid, dead_pname = parse_death(tag, message)
+            if dead_pid and dead_pid in pids:
+              pids.remove(dead_pid)
+              linebuf  = '\n' + colorize(' ' * (header_size - 1), bg=RED)
+              linebuf += ' Process %s (PID: %s) ended' % (dead_pname, dead_pid)
+              linebuf += '\n'
+              print(linebuf)
+              last_tag = None
 
-      if tag == 'DEBUG' and BACKTRACE_LINE.match(message.lstrip()):
-        message = message.lstrip()
-        owner = app_pid
+            if tag == 'DEBUG' and BACKTRACE_LINE.match(message.lstrip()):
+              message = message.lstrip()
+              owner = app_pid
 
-      if not args.all and owner not in pids: continue
-      if level in LOG_LEVELS_MAP and LOG_LEVELS_MAP[level] < min_level: continue
-      if args.ignored_tag and tag_in_tags_regex(tag, args.ignored_tag): continue
-      if args.tag and not tag_in_tags_regex(tag, args.tag): continue
+            if not args.all and owner not in pids: continue
+            if level in LOG_LEVELS_MAP and LOG_LEVELS_MAP[level] < min_level: continue
+            if args.ignored_tag and tag_in_tags_regex(tag, args.ignored_tag): continue
+            if args.tag and not tag_in_tags_regex(tag, args.tag): continue
 
-      linebuf = ''
-      if args.tag_width > 0:
-        if tag != last_tag or args.always_tags:
-          last_tag = tag
-          color = allocate_color(tag)
-          tag = tag[-args.tag_width:].rjust(args.tag_width)
-          linebuf += colorize(tag, fg=color)
-        else:
-          linebuf += ' ' * args.tag_width
-        linebuf += ' '
+            linebuf = ''
+            if args.tag_width > 0:
+              if tag != last_tag or args.always_tags:
+                last_tag = tag
+                color = allocate_color(tag)
+                tag = tag[-args.tag_width:].rjust(args.tag_width)
+                linebuf += colorize(tag, fg=color)
+              else:
+                linebuf += ' ' * args.tag_width
+              linebuf += ' '
 
-      linebuf += TAGTYPES.get(level, ' ' + level + ' ')
-      linebuf += ' '
+            linebuf += TAGTYPES.get(level, ' ' + level + ' ')
+            linebuf += ' '
 
-      for matcher, replace in RULES.items():
-        message = matcher.sub(replace, message)
+            for matcher, replace in RULES.items():
+              message = matcher.sub(replace, message)
 
-      linebuf += indent_wrap(message)
-      print(linebuf)
+            linebuf += indent_wrap(message)
+            print(linebuf)
 
-except KeyboardInterrupt:
-    print("\n--- Exiting gracefully. ---")
-except Exception as e:
-    print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
+        except KeyboardInterrupt:
+            print("\n--- Exiting gracefully. ---")
+        except Exception as e:
+            print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
 finally:
     # De-initialize colorama to restore original terminal settings.
     colorama.deinit()
